@@ -1,14 +1,18 @@
-from os.path import join,exists,basename
-from os import listdir
-#import xml.etree.ElementTree as ET
+from os.path import join,exists,basename,abspath,normpath
+from os import listdir,system
 from lxml import etree as ET
 import json
+import geojson
 import shapely
+import codecs
 from shapely.geometry import mapping, shape
 from more_itertools import chunked
 import zipfile as zf
 from collections import OrderedDict as OD
-#from rtree import index
+from rtree import index
+from sys import exit
+
+from utils import u_rmall as rmall,u_tmpdir as tmpdir,u_getfiles as getfiles
 
 __Enc__ = ('utf-8', 'euc_jp', 'euc_jis_2004', 'euc_jisx0213',
         'shift_jis', 'shift_jis_2004','shift_jisx0213',
@@ -21,45 +25,41 @@ __dtype__ = ('AdmArea','AdmBdry','AdmPt','Anno','BldA','BldL','BldSbl','Cntr',
         'SBAPt','SBBdry','SpcfArea','TrfStrct','TrfTnnEnt','VegeClassL','VLine',
         'WA','WL','WoodRes','WStrA','WStrL','DEM','dem')
 
+__ftype__ = ('alti')
+
+__itype__ = ('altiAcc','dimension')
 
 class loader:
-    def __init__(self,path=None):
-        self.path = path
-        self.code = None
+    def __init__(self,path,shpfile=False):
+        self.path = normpath(abspath(path))
         self.gobj = {}
-        if path is not None:
+        self.code = None
+
+        if shpfile:
+            dpath = tmpdir("tmp",basename(path).split(".")[0])
+            system("cd " + dpath + "; unzip " + self.path)
+            shpfiles = getfiles(dpath,".shp")
+            for x in shpfiles:
+                p = join(dpath,x)
+                geop = p[:-3] + "geojson"
+                cmd = "ogr2ogr -f GeoJSON " + geop + " " + p
+                print "running",cmd
+                system(cmd)
+                bs = basename(p).split("-")
+                f = bs[3]
+                if self.code is None:
+                    self.code = bs[2]
+                geo = geojson.load(codecs.open(geop,encoding="shift_jisx0213"))
+                self.gobj.setdefault(f,[]).extend(geo["features"])
+            rmall(dpath)
+        else:
             self.file_open()
             self.get_code()
-            
-    def copy(self):
-        new = loader()
-        new.code = self.code
-        new.gobj = {}
 
-        for x in self.gobj:
-            print("x",x,type(x))
-            val = self.gobj[x]
-            print("val",type(val))
-            newval = []
-            for y in val:
-                print("y",type(y))
-                newy = OD()
-                for k in y:
-                    if k != "geometry":
-                        newy[k] = y[k]
-                    else:
-                        newgeom = OD()
-                        newgeom["type"] = y[k]["type"]
-                        newgeom["coordinates"] = [z[:] for z in y[k]["coordinates"]]
-                        newy[k] = newgeom
-                newval.append(newy)
-            new.gobj[x] = newval
-        return new    
-            
     def get_code(self,fname=None):
         if fname is None:
             fname = self.path
-        f = fname.split('-')
+        f = basename(fname).split('-')
         if len(f) > 3:
             self.code = f[2]
 
@@ -132,8 +132,6 @@ class loader:
         print 'Start file Load..'
         parser = ET.XMLParser(ns_clean=True,recover=True,encoding=enc)
         root = ET.fromstring(data.encode(enc),parser=parser)
-        #tree = ET.parse(file,parser=parser)
-        #root = tree.getroot()
         self.ns = root.nsmap
         self.ns_clean()
         l_obj = []
@@ -173,11 +171,6 @@ class loader:
         num = 0
         for col in range(ns[0]):
             for row in range(ns[1]):
-                y = mins[0] + (col/ns[0])*delta[0]
-                x = mins[1] + (row/ns[1])*delta[1]
-                dic['geometry']['type'] = 'Point'
-                dic['geometry']['coordinates'] = [x,y]
-                ret.append(dic)
                 new = dict(dic)
                 pro2 = dict(pro)
                 y = mins[0] + (float(col)/float(ns[0]))*float(delta[0])
@@ -190,6 +183,7 @@ class loader:
                 new['properties'] = pro2
                 ret.append(new)
                 num += 1
+        ret = self.chk_types(ret)
         return ret
 
     def parse_obj(self,obj,dtype):
@@ -198,22 +192,24 @@ class loader:
         for child in obj:
             ctag = self.clip_tag(child.tag)
             if ctag in ['pos','area','loc']:
-                if ctag == 'pos':
-                    dic['geometry']['type'] = 'Point'
-                elif ctag == 'area':
+                if ctag == 'area':
                     dic['geometry']['type'] = 'Polygon'
-                elif ctag == 'loc':
-                    dic['geometry']['type'] = 'LineString'
-                i = ""
-                for l in child.itertext():
-                    i += l
-                l = list(chunked(i.strip().split(),2))
-                i = [[float(xy[1]),float(xy[0])] for xy in l]
-
-                if len(i) == 1:
-                    dic['geometry']['coordinates'] = i[0]
+                    dic['geometry']['coordinates'] = self.get_polygon_coord(child)
                 else:
-                    dic['geometry']['coordinates'] = i
+                    if ctag == 'pos':
+                        dic['geometry']['type'] = 'Point'
+                    elif ctag == 'loc':
+                        dic['geometry']['type'] = 'LineString'
+                    i = ""
+                    for l in child.itertext():
+                        i += l
+                    l = list(chunked(i.strip().split(),2))
+                    i = [[float(xy[1]),float(xy[0])] for xy in l]
+
+                    if len(i) == 1:
+                        dic['geometry']['coordinates'] = i[0]
+                    else:
+                        dic['geometry']['coordinates'] = i
             elif not child.text.strip() == '':
                 dic['properties'][ctag]=child.text
             else:
@@ -221,7 +217,30 @@ class loader:
                 for l in child.itertext():
                     i += l
                 dic['properties'][ctag]=i.strip()
+        dic = self.chk_types(dic)
         return dic
+
+    def get_polygon_coord(self,obj):
+        #get exterior coords
+        coord = []
+        i = ""
+        ext = obj.find('.//gml:exterior',self.ns)
+        for l in ext.itertext():
+            i += l
+        l = list(chunked(i.strip().split(),2))
+        coord.append([[float(xy[1]),float(xy[0])] for xy in l])
+        #get interior coords
+        inte = obj.findall('.//gml:interior',self.ns)
+        if not inte:
+            return coord
+        else:
+            for i in inte:
+                j = ""
+                for l in i.itertext():
+                    j += l
+                l = list(chunked(j.strip().split(),2))
+                coord.append([[float(xy[1]),float(xy[0])] for xy in l])
+        return coord
 
     def chk_dtype(self,path):
         fname = basename(path)
@@ -230,61 +249,69 @@ class loader:
                 return i
         return 'NULL'
 
-    def rindex(self,feature):
+    def rindex(self,feature,rtree=False,shpfile=True):
         val = self.gobj[feature]
-        #idx = index.Index()
+        if rtree:
+            idx = index.Index()
         for i,y in enumerate(val):
-            newy = {}
-            for k in y:
-                if k != "geometry":
-                    newy[k] = y[k]
-                else:
-                    if "shapely" in y[k]:
-                        s = y[k]["shapely"]
-                    else:
-                        g = y[k]
-                        gc = g["coordinates"]
-                        coords = [tuple(w) for w in gc]
-                        if y[k]["type"] == "Polygon":
-                            ps = [[]]
-                            for x in coords:
-                                t = tuple(x)
-                                if ps[-1] and t == ps[-1][0]:
-                                     ps[-1].append(t)
-                                     assert(len(ps[-1]) > 2)
-                                     ps.append([])
-                                else:
-                                    ps[-1].append(t)
-                            assert(ps[-1] == [])
-                            ps.pop()
-                            if len(ps) > 1:
-                            #    print ps
-                            #    print(0,len(ps[0]))
-                            #    print(1,len(ps[1:]),[len(x) for x in ps])
-                                s = shapely.geometry.Polygon(ps[0],ps[1:])
-                                #print("HOLES T",s.type)
-                                #print("HOLES C",s.coords)
-                            else:
-                                s = shapely.geometry.Polygon(ps[0])
-                        elif y[k]["type"] == "LineString":
-                            s = shapely.geometry.LineString(coords)
-                        elif y[k]["type"] == "Point":
-                            s = shapely.geometry.Point(coords)
+            k = "geometry"
+            g = y[k]
+            gc = g["coordinates"]
+            if y[k]["type"] == "Polygon":
+                if shpfile:
+                    try:
+                        if len(gc) == 1:
+                            s = shapely.geometry.Polygon(gc[0])
                         else:
-                            raise NotImplementedError(y[k]["type"])
-                        if not s.is_valid:
-                            s = s.buffer(0)
-                        y[k]["shapely"] = s
-                    #idx.insert(i,s.bounds)
-        return #idx
-                        
-    
+                            s = shapely.geometry.Polygon(gc[0],gc[1:])
+                    except:
+                        print "Y",y
+                        print "GC",gc
+                        raise
+
+                else:
+                    coords = [tuple(w) for w in gc]
+                    # need to deal with holes properly
+                    ps = [[]]
+                    for x in coords:
+                        t = tuple(x)
+                        if ps[-1] and t == ps[-1][0]:
+                            ps[-1].append(t)
+                            assert(len(ps[-1]) > 2)
+                            ps.append([])
+                        else:
+                            ps[-1].append(t)
+                    if ps[-1] != []:
+                        print "Y",y
+                        print "PS",ps
+                    assert(not ps[-1])
+                    ps.pop()
+                    if len(ps) > 1:
+                        s = shapely.geometry.Polygon(ps[0],ps[1:])
+                    else:
+                        s = shapely.geometry.Polygon(ps[0])
+            elif y[k]["type"] == "LineString":
+                coords = [tuple(w) for w in gc]
+                s = shapely.geometry.LineString(coords)
+            elif y[k]["type"] == "Point":
+                s = shapely.geometry.Point(tuple(gc))
+            else:
+                raise NotImplementedError(y[k]["type"])
+            if not s.is_valid: # fix invalid polygons
+                s = s.buffer(0)
+            y[k]["shapely"] = s
+            if rtree:
+                idx.insert(i,s.bounds)
+        if rtree:
+            return idx
+
     def extract2(self,bounds,vals,idx):
         box = shapely.geometry.box(*bounds)
         ret = []
 
-        #for i in idx.intersection(bounds):
-        for y in vals:
+        for i in idx.intersection(bounds): # rtree
+            y = vals[i]                    # rtree
+        #for y in vals:                    # !rtree
             s = y["geometry"]["shapely"]
             try:
                 if not box.disjoint(s):
@@ -296,14 +323,13 @@ class loader:
                 print("SSS",s.type)
                 print("SSS",s.boundary.coords)
                 print("YYY",y["geometry"])
-                raise                
+                raise
         return ret
-    
-    def extract3(self,bxs,vals,idx):
+
+    def extract3(self,bxs,vals):
         ret = {}
 
-        #for i in idx.intersection(bounds):
-        for y in vals:
+        for y in vals:                    # !rtree
             s = y["geometry"]["shapely"]
             tmp = {}
             for xid,yid,box in bxs:
@@ -314,33 +340,9 @@ class loader:
                     print("SSS",s.type)
                     print("SSS",s.boundary.coords)
                     print("YYY",y["geometry"])
-                    raise                                    
+                    raise
             for (xid,yid) in tmp.keys():
                 newy = OD(y)
                 newy['geometry'] = mapping(tmp[xid,yid])
                 ret.setdefault((xid,yid),[]).append(newy)
         return ret
-
- 
-            
-        
-def json_dump(dic,out):
-    for k,v in dic.items():
-        json_dic = {'type':'FeatureCollection', 'features':v}
-        txt = json.dumps(json_dic,indent=2,ensure_ascii=False)
-        fw = open(join(out,k+'.geojson'),'w')
-        fw.write(txt.encode('utf_8'))
-        fw.close()
-
-        
-if __name__ == '__main__':
-    from sys import argv
-    print argv[1]
-
-    a = loader(argv[1])
-    c = a.extract(139.5,139.7,30,40)
-    for x in c:
-        print mapping(x)
-    #print c.gobj['AdmArea'][0]["geometry"]
-    #json_dump(a.gobj,argv[2])
-
