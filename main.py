@@ -1,35 +1,36 @@
 from clipping import main as clip
-from os import listdir,walk,system,chdir,curdir
+from os import listdir,walk,system,chdir,curdir,rmdir
 from os.path import join,isdir,exists,abspath,dirname,normpath
 import geojson
 
-from utils import fmakedirs as makedirs, fcp as cp
+from utils import u_makedirs as makedirs, u_cp as cp, u_rm as rm, u_getfiles as getfiles, u_rmall as rmall
 
-def get_geojson(path):
-    save = abspath(curdir)
-    chdir(path)
-    ret = []
-    for root,dirs,files in walk("."):
-        ret += [normpath(join(root,x)) for x in files if x.endswith("geojson")]
-    chdir(save)        
+def get_geojson(path,zoom=None):
+    ret = getfiles(path,".geojson")
+    if zoom is not None:
+        ret = [x
+               for x in ret
+               if x.split("/")[1:2] == [zoom]]
     return ret
 
-def run(cmd,path,zoom,base,features,test,code):
-    ext = ".tmp"
-    if cmd == "add": # extract geojson from file
-        clip(zoom,path,base,features,test)
+def run(cmd,path,zoom,base,features,test,code,shpfile,mergedir):
+    if cmd == "add": 
+        clip(zoom,path,base,features,test,code,shpfile)
     elif cmd == "update":
-        code = clip(zoom,path,base+ext,features,test)        
-        diffs = get_diffs(base,base+ext,code)
+        ext = ".tmp"
+        code = clip(zoom,path,base+ext,features,test,code,shpfile)        
+        diffs = get_diffs(base,base+ext,code,zoom)
+        rmall(base+ext)
+        rmdir(base+ext)
         print "CHANGED:",len(diffs) 
-        merge_diffs(base,base+ext,code,diffs,path)
+        merge_diffs(base,mergedir,diffs)
     else:
         assert(cmd == "merge")
-        merge(path,base,features,test=test)
+        merge(base,mergedir,zoom)
 
-def get_diffs(base1,base2,code):
-    old = get_geojson(join(base1,code))
-    tmp = get_geojson(join(base2,code))
+def get_diffs(base1,base2,code,zoom):
+    old = get_geojson(join(base1,code),zoom)
+    tmp = get_geojson(join(base2,code),zoom)
 
     changed = []
     for x in tmp:
@@ -43,46 +44,67 @@ def get_diffs(base1,base2,code):
         else:
             changed.append(x)
             cp(xtmp,xold)
+    for x in old:
+        if x not in tmp:
+            xold = join(base1,code,x)
+            changed.append(x)
+            rm(xold)
     return changed
 
-def merge_diffs(base1,base2,code,diffs,out):
-    M = {}
-    for x in diffs:
-        for c in dirs: #code 
-            path = join(base,c,x)
-            if exists(path):
-                M.setdefault(x,[]).append(c)
-    merge_json(M,base,out)
-        
-def merge(out,base,features,prefix="M_",test=False):
+def merge_diffs(base,out,diffs,prefix="M_"):
     dirs = [x
             for x in listdir(base)
             if isdir(join(base,x)) and not x.startswith(prefix)]
     M = {}
-    print("TEST",test)
-
-    for x in dirs: #code 
-        path = join(base,x)
-        for y in get_geojson(path):
-            print("XY",x,y)
-            if test:
-                ys = y.split("/")
-                newy = "/".join(ys[1:])
-                newx = x+"/"+ys[0]
-                print("NEWXY",newx,newy)
-                M.setdefault(newy,[]).append(newx)
-            else:
-                M.setdefault(y,[]).append(x)
+    for x in diffs:
+        M[x] = []
+        for code in dirs: 
+            path = join(base,code,x)
+            if exists(path):
+                M[x].append(code)
+    merge_json(M,base,prefix+out)
+        
+def merge(base,out,zoom,prefix="M_"):
+    dirs = [x
+            for x in listdir(base)
+            if isdir(join(base,x)) and not x.startswith(prefix)]
+    M = {}
+    for code in dirs: 
+        path = join(base,code)
+        for y in get_geojson(path,zoom):
+            M.setdefault(y,[]).append(code)
     merge_json(M,base,prefix+out)
         
 def merge_json(M,base,out):
+    print "BO",base,out
+    if True:
+        NEWM = {}
+        check = set()
+        for path in M:
+            if not M[path]:
+                ps = path.split("/")
+                newpath = "/".join(ps[1:])                
+                check.add(newpath)
+            for code in M[path]:
+                ps = path.split("/")
+                newpath = "/".join(ps[1:])
+                newcode = code+"/"+ps[0]
+                NEWM.setdefault(newpath,[]).append(newcode)
+        for x in check:
+            if x not in NEWM:
+                NEWM[x] = []
+        M = NEWM
+            
     for k in M:
         new = join(base,out,k)
         makedirs(dirname(new))
-        if len(M[k]) == 1:
+        if len(M[k]) == 0:
+            rm(new)
+        elif len(M[k]) == 1:
             old = join(base,M[k][0],k)
             cp(old,new)
         else:
+            print "K",k,"MK",M[k][:10]
             gs = [(x,geojson.load(open(join(base,x,k)))) for x in M[k]]
             x0,g = gs[0]
             for x,h in gs[1:]:
@@ -96,13 +118,15 @@ def help(name,ret):
     print "usage:"
     print name,"[-h]"
     print "    this help message"
-    print name,"app path | update path | merge path [-b base] [-c code] [-f features] [-z zoom]"
+    print name,"(add path | update path [-m mergedir] | merge [-m mergedir]) [-b base] [-c code] [-f features] [-z zoom] [-s]"
     print "where"
-    print "path    => path to gml/shp data for add/update; mergedir otherwise "
-    print "base    => path to root directory                            (default '.')"
-    print "code    => date code (only needed for irregular filenames)"
-    print "feature => comma-separated list of features, e.g AdmArea,... (default all)"
-    print "zoom    => zoom factor                                       (default 18)"
+    print "path     => path to gml/shp data for add/update; mergedir otherwise "
+    print "base     => path to root directory                            (default '.')"
+    print "mergedir => mergedir (used by merge and update)"
+    print "code     => date code (only needed for irregular filenames)"
+    print "feature  => comma-separated list of features, e.g AdmArea,... (default all)"
+    print "zoom     => zoom factor                                       (default 18)"
+    print "use option '-s' when adding shapefiles"
     exit(ret)
 
 if __name__ == "__main__":
@@ -113,6 +137,9 @@ if __name__ == "__main__":
     features = []
     zoom = 18
     test = False
+    shpfile = False
+    mergedir = None
+    path = None
     
     n = len(argv)
     if n == 1:
@@ -124,29 +151,43 @@ if __name__ == "__main__":
 
     try:
         cmd = argv[1]
-        path = argv[2]        
         assert(cmd in ("add","update","merge"))
+            
+        if cmd == "merge":
+            off = 0
+        else:
+            off = 1        
+            path = argv[2]        
+
         
-        for i,opt in enumerate(argv[3:]):
+        for i,opt in enumerate(argv[2+off:]):
             if opt == "-b":
-                base = argv[3+i+1]
-            elif opt == "-c":
-                code = argv[3+i+1]
+                base = argv[2+off+i+1]
+            elif opt == "-m":
+                mergedir = argv[2+off+i+1]
+            elif opt == "-c":                
+                code = argv[2+off+i+1]
             elif opt == "-f":
-                features = argv[3+i+1].split(",")
+                features = argv[2+off+i+1].split(",")
             elif opt == "-z":
-                zoom = int(argv[3+i+1])
+                zoom = int(argv[2+off+i+1])
             elif opt == "-t":
                 test = True
+            elif opt == "-s":
+                shpfile = True
+
         if exists(base):
             assert(isdir(base))
-        if cmd == "merge" and not exists(path):
-            makedirs(path)
+
+        if cmd != "add":
+            assert(mergedir is not None)
+            
         assert(path is None or exists(path))
         assert(10 <= zoom and zoom <= 24)
+
     except:
         raise
         help(argv[0],1)
         
-    run(cmd=cmd,path=path,zoom=zoom,code=code,base=base,features=features,test=test)
+    run(cmd=cmd,path=path,zoom=str(zoom),code=code,base=base,features=features,test=test,shpfile=shpfile,mergedir=mergedir)
 

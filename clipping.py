@@ -4,11 +4,11 @@ import pyproj
 import json
 import geojson
 import globalmaptiles
-from loadtmp import loader
+from load import loader
 from shapely.geometry import mapping,box
 from datetime import datetime as dt
 
-from utils import fmakedirs as makedirs
+from utils import u_makedirs as makedirs
 
 def conv_latlon(lat,lon,inv=None):
 	if inv is None:
@@ -58,6 +58,8 @@ def get_latlon_corners(code):
 	return (minlat,maxlat,minlon,maxlon)
 
 def get_tile_id_corner(code,zoom):
+	if not isinstance(zoom,int):
+		zoom=int(zoom)
 	minlat,maxlat,minlon,maxlon = get_latlon_corners(code)
 	min_my,min_mx = conv_latlon(minlat,minlon)
 	max_my,max_mx = conv_latlon(maxlat,maxlon)
@@ -112,16 +114,13 @@ def json_dump(dic,out,dpath,z,x,y):
 	idx,idy = mercator.GoogleTile(x,y,z)
 	l = None
 	for k,v in dic.items():
-		if l is None:
-			l = v
-		else:
-			l.extend(v)
+                if not v:
+                        continue
 	        path = join(out,dpath,k,str(z),str(idx))
 	        makedirs(path)
-	        json_dic = {'type':'FeatureCollection', 'features':l}
+	        json_dic = {'type':'FeatureCollection', 'features':v}
 	        txt = json.dumps(json_dic,indent=2,ensure_ascii=False)
 	        p = join(path,str(idy)+'.geojson')
-                #print "dumping",p
 	        fw = open(p,'w')
 	        fw.write(txt.encode('utf_8'))
 	        fw.close()
@@ -134,20 +133,13 @@ def main_shp(zoom,path,out,features=None,test=False):
         gobj = geojson.load(geopath)
 
         
-def main(zoom,path,out,features=None,test=False):
-	a = loader(path)
-        code = str(a.code)
+def main(zoom,path,out,features=None,test=False,code=None,shpfile=False):
+        start = dt.now()
+	a = loader(path,shpfile)
+        print "TIME LOAD:",dt.now() - start
+        if code is None:
+                code = str(a.code)
 	trng = get_tile_id_corner(code,zoom)
-
-        # output folder
-        dpath = splitext(basename(path))[0]
-        try:
-                tmp = dt.strptime(dpath[-8:],"%Y%m%d")
-                if tmp.year < 1900 or tmp.year > 2100:
-                        raise ValueError
-                dpath = dpath[:-8].rstrip("_")
-        except:
-                pass
 
         # check featurelist
         for x in features:
@@ -165,44 +157,48 @@ def main(zoom,path,out,features=None,test=False):
 		                a.gobj[f][i],coord_tab = conv_proj(a.gobj[f][i],coord_tab)
 
         # generate index
-	start = dt.now()
         idx = {}
         vals = {}
         for f in a.gobj:
                 if not features or f in features:                
-	                idx[f] = a.rindex(f)
+	                idx[f] = a.rindex(f,rtree=not test)
 	                vals[f] = a.gobj[f]
-
+	print "TIME INDEX:",dt.now() - start
         # generate bounds
         bs = []
         bxs = []
 	for xid in range(trng[0][0],trng[0][1]+1):
 		for yid in range(trng[1][0],trng[1][1]+1):
-			bounds = get_clip_bound(xid,yid,zoom)
+			bounds = get_clip_bound(xid,yid,int(zoom))
                         bs.append((xid,yid,tuple(bounds)))
                         bxs.append((xid,yid,box(*bounds)))
 
         res = {}        
         if test:
                 for f in vals:
-                        print "EXTRACT",f
-                        tmp = a.extract3(bxs,vals[f],idx[f])
-                        print "EXTRACT DONE"
+                        #print "EXTRACT",f,
+                        tmp = a.extract3(bxs,vals[f])
+                        #print "DONE"
                         for xid,yid in tmp.keys():
                                 res[xid,yid,f] = tmp[xid,yid]
         else:
                 for xid,yid,bounds in bs:
+                        res[xid,yid] = {}
                         for f in vals:
-                                print "EXTRACT",bounds,f
-                                res[xid,yid,f] = a.extract2(bounds,vals[f],idx[f])
-                                print "EXTRACT DONE"
+                                #print "EXTRACT",bounds,f,
+                                res[xid,yid][f] = a.extract2(bounds,vals[f],idx[f])
+                                #print "DONE"
+	print "TIME EXTRACT:",dt.now() - start                        
         for k in res:
-                res[k] = [inv_conv_proj(x,coord_tab) for x in res[k]]
+                for kk in res[k]:
+                        res[k][kk] = [inv_conv_proj(x,coord_tab) for x in res[k][kk]]
 
+	print "TIME COORD:",dt.now() - start
         for xid in range(trng[0][0],trng[0][1]+1):
 		for yid in range(trng[1][0],trng[1][1]+1):
-                        dumpres = {f:v for (x,y,f),v in res.items() if xid == x and yid == y}
-		        json_dump(dumpres,out,dpath,zoom,xid,yid)
+                        dumpres = res[xid,yid]
+                        if dumpres:
+		                json_dump(dumpres,out,code,int(zoom),xid,yid)
 
-	print "TIME:",dt.now() - start
-        return dpath
+	print "TIME DUMP:",dt.now() - start
+        return code
