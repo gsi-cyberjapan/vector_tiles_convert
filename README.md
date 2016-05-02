@@ -49,7 +49,7 @@ CentOS（RedHat系 Linux）の環境を想定し、環境設定の方法を以�
   C++のオープンソースジオメトリエンジンである「GEOS」（ライセンス：LGPL）を用いたPythonのジオメトリライブラリであり、ポイント、ライン、ポリゴンなどの地物に関する処理が可能。
   タイル作成時、地物のクリップ処理に使用。
   - URL：https://pypi.python.org/pypi/Shapely/1.5.13
-  - インストールの実行：`yum install geos`（GEOSがインストールされていない場合）
+  - インストールの実行：`yum install geos`（GEOSがインストールされていない場合）  
   　　　　　　　　　　`pip install shapely`
 - geojson
   GeoJSONのオブジェクトをPythonで扱えるような機能をもつライブラリ。
@@ -59,7 +59,7 @@ CentOS（RedHat系 Linux）の環境を想定し、環境設定の方法を以�
   空間探索のライブラリである「libspatialindex」をPythonで扱えるようにするラッパープログラム。
   タイルのクリップ処理の際に対象地物を選定するために使用。
   - URL：https://pypi.python.org/pypi/Rtree/
-  - インストールの実行：`yum install spatialindex`
+  - インストールの実行：`yum install spatialindex`  
   　　　　　　　　　　`pip install rtree`
 
 ### その他のライブラリ
