@@ -1,5 +1,6 @@
 from os import makedirs,rmdir,walk,remove,chdir,curdir
 from os.path import exists,dirname,join,normpath,abspath
+import codecs
 
 def u_makedirs(d):
     if not exists(d):
@@ -7,24 +8,37 @@ def u_makedirs(d):
 
 def u_cp(a,b):
     u_makedirs(dirname(b))
-    f=open(b,"w")
-    f.write(open(a).read())
+    f=codecs.open(b,"w",encoding="utf8")
+    f.write(codecs.open(a,encoding="utf8").read())
     f.close()
 
 def u_rm(x):
-    if exists(d):
+    if exists(x):
         remove(x)
 
-def u_rmall(path):
+def u_rmall(path,strict=False):
     rm = []
     drm = []
     for root,dirs,files in walk(path):
         rm += [normpath(join(root,x)) for x in files]
         drm += [normpath(join(root,x)) for x in dirs]
     for x in rm:
-        remove(x)
+        try:
+            remove(x)
+        except:
+            if strict:
+                raise
+            else:
+                print "WARNING: failed to delete",x
+
     for x in sorted(drm,key=lambda x:-len(x)):
-        rmdir(x)
+        try:
+            rmdir(x)
+        except:
+            if strict:
+                raise
+            else:
+                print "WARNING: failed to delete",x
 
 def u_tmpdir(path,name):
     n = 0

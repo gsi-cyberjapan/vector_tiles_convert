@@ -1,7 +1,8 @@
 from clipping import main as clip
-from os import listdir,walk,system,chdir,curdir,rmdir
+from os import listdir,walk,system,chdir,curdir,rmdir,getpid
 from os.path import join,isdir,exists,abspath,dirname,normpath
 import geojson
+import codecs
 
 from utils import u_makedirs as makedirs, u_cp as cp, u_rm as rm, u_getfiles as getfiles, u_rmall as rmall
 
@@ -17,9 +18,9 @@ def run(cmd,path,zoom,base,features,test,code,shpfile,mergedir):
     if cmd == "add": 
         clip(zoom,path,base,features,test,code,shpfile)
     elif cmd == "update":
-        ext = ".tmp"
+        ext = ".tmp"+str(getpid())
         code = clip(zoom,path,base+ext,features,test,code,shpfile)        
-        diffs = get_diffs(base,base+ext,code,zoom)
+        diffs = get_diffs(base,base+ext,code[1],zoom)
         rmall(base+ext)
         rmdir(base+ext)
         print "CHANGED:",len(diffs) 
@@ -38,7 +39,7 @@ def get_diffs(base1,base2,code,zoom):
         xold = join(base1,code,x)
         
         if x in old:
-            if open(xtmp).read() != open(xold).read():
+            if codecs.open(xtmp,encoding="utf8").read() != codecs.open(xold,encoding="utf8").read():
                 changed.append(x)
                 cp(xtmp,xold)
         else:
@@ -104,14 +105,12 @@ def merge_json(M,base,out):
             old = join(base,M[k][0],k)
             cp(old,new)
         else:
-            print "K",k,"MK",M[k][:10]
-            gs = [(x,geojson.load(open(join(base,x,k)))) for x in M[k]]
+            gs = [(x,geojson.load(codecs.open(join(base,x,k),encoding="utf8"))) for x in M[k]]
             x0,g = gs[0]
             for x,h in gs[1:]:
-                print "merging",x0,x
                 g["features"] += h["features"]
-            f = open(new,"w")
-            geojson.dump(g,f)
+            f = codecs.open(new,"w",encoding="utf8")
+            geojson.dump(g,f,ensure_ascii=False)
             f.close()
 
 def help(name,ret):
@@ -183,7 +182,7 @@ if __name__ == "__main__":
             assert(mergedir is not None)
             
         assert(path is None or exists(path))
-        assert(10 <= zoom and zoom <= 24)
+        assert(1 <= zoom and zoom <= 24)
 
     except:
         raise

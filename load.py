@@ -1,16 +1,20 @@
 from os.path import join,exists,basename,abspath,normpath
-from os import listdir,system
+from os import listdir,system,environ,unlink
 from lxml import etree as ET
+from random import randint
 import json
 import geojson
 import shapely
 import codecs
 from shapely.geometry import mapping, shape
+from shapely.validation import explain_validity
 from more_itertools import chunked
 import zipfile as zf
 from collections import OrderedDict as OD
 from rtree import index
+from rtree.core import RTreeError
 from sys import exit
+from fixpoly import fix_mpoly, fix_poly, fix_lr, fix_ls
 
 from utils import u_rmall as rmall,u_tmpdir as tmpdir,u_getfiles as getfiles
 
@@ -37,31 +41,73 @@ class loader:
 
         if shpfile:
             dpath = tmpdir("tmp",basename(path).split(".")[0])
-            system("cd " + dpath + "; unzip " + self.path)
+            if path.lower().endswith(".zip"):
+                self.get_code()
+                system("cd " + dpath + "; unzip " + self.path)
+            else:
+                assert(self.path.lower().endswith(".shp"))
+                system("cd " + dpath + "; cp " + self.path[:-4]+"*" + " .")
             shpfiles = getfiles(dpath,".shp")
             for x in shpfiles:
                 p = join(dpath,x)
                 geop = p[:-3] + "geojson"
+                if "SHAPE_ENCODING" not in environ or not environ["SHAPE_ENCODING"]:
+                    environ["SHAPE_ENCODING"] = "cp932"
                 cmd = "ogr2ogr -f GeoJSON " + geop + " " + p
                 print "running",cmd
                 system(cmd)
                 bs = basename(p).split("-")
-                f = bs[3]
+                if len(bs) > 4:
+                    f = bs[3]
+                else:
+                    f = 'shapefile'
+
                 if self.code is None:
-                    self.code = bs[2]
-                geo = geojson.load(codecs.open(geop,encoding="shift_jisx0213"))
+                    if len(bs) > 4 and len(bs[3]) in (4,6,8) and set(bs[3]) in set("0123456789"):
+                        self.code = ['code',bs[3]]
+                    else:
+                        self.code = ['corner', self.get_corner(p)]
+                elif self.code[0] == 'corner':
+                    self.code[1] = self.get_corner(p,self.code[1])
+
+                fgeo = open(geop,'r')
+                data, enc = self.detect_enc(fgeo.read())
+
+                geo = geojson.load(codecs.open(geop,encoding=enc))
                 self.gobj.setdefault(f,[]).extend(geo["features"])
             rmall(dpath)
         else:
             self.file_open()
             self.get_code()
 
+    def get_corner(self,path,o_code=None):
+        s = str(randint(1,999999999999))
+        tmp = "log_" + s
+        cmd = "ogrinfo -al -so " + path + "> " + tmp
+        system(cmd)
+        for l in open(tmp):
+            if l.startswith('Extent:'):
+                for x in '()-,': l = l.replace(x,'')
+                l = l.split()
+                assert(len(l) == 5)
+                code = [[float(l[1]),float(l[3])],[float(l[2]),float(l[4])]]
+                break
+        unlink(tmp)
+
+        if not o_code is None:
+            code[0][0] = min(code[0][0],o_code[0][0])
+            code[1][0] = min(code[1][0],o_code[1][0])
+            code[0][1] = max(code[0][1],o_code[0][1])
+            code[1][1] = max(code[1][1],o_code[1][1])
+
+        return code
+
     def get_code(self,fname=None):
         if fname is None:
             fname = self.path
         f = basename(fname).split('-')
         if len(f) > 3:
-            self.code = f[2]
+            self.code = ['code',f[2]]
 
     def file_open(self):
         if self.path.endswith('.zip'):
@@ -83,6 +129,7 @@ class loader:
             raise EncodingError
 
     def xml_file_open(self):
+        print 'Start file Load..' + self.path
         f = open(self.path,'r')
         data, enc = self.detect_enc(f.read())
         self.load(data,enc,self.chk_dtype(self.path))
@@ -93,7 +140,9 @@ class loader:
             if not self.chk_dtype(l) == 'NULL':
                 print self.chk_dtype(l)
                 f = zfile.open(l)
+                print 'Start file Load..' + l
                 data, enc = self.detect_enc(f.read())
+                print("DETECTED:",l,enc)
                 self.load(data,enc,self.chk_dtype(l))
 
     def clip_tag(self,str):
@@ -129,8 +178,7 @@ class loader:
 
 
     def load(self,data,enc,dtype):
-        print 'Start file Load..'
-        parser = ET.XMLParser(ns_clean=True,recover=True,encoding=enc)
+        parser = ET.XMLParser(ns_clean=True,recover=True,encoding=enc,huge_tree=True)
         root = ET.fromstring(data.encode(enc),parser=parser)
         self.ns = root.nsmap
         self.ns_clean()
@@ -141,7 +189,11 @@ class loader:
                     if dtype == "DEM" or dtype=="dem":
                         l_obj = self.parse_dem_obj(child)
                     else:
-                        l_obj.append(self.parse_obj(child,dtype))
+                        obj = self.parse_obj(child,dtype)
+                        if isinstance(obj,list):
+                            l_obj += obj
+                        else:
+                            l_obj.append(obj)
         if dtype in self.gobj:
             self.gobj[dtype].extend(l_obj)
         else:
@@ -156,30 +208,62 @@ class loader:
             ctag = self.clip_tag(child.tag)
             if ctag == 'coverage':
                 vs = child.find('.//gml:tupleList',self.ns).text.split()
-                n_xy = child.find('.//gml:high',self.ns).text.split()
+                low_xy = child.find('.//gml:low',self.ns).text.split()
+                high_xy = child.find('.//gml:high',self.ns).text.split()
                 min_xy = child.find('.//gml:lowerCorner',self.ns).text.split()
                 max_xy = child.find('.//gml:upperCorner',self.ns).text.split()
-                ns = [int(x) for x in n_xy]
+                order = child.find('.//gml:sequenceRule',self.ns).attrib["order"] 
+                sp = tuple(int(x) for x in child.find('.//gml:startPoint',self.ns).text.split())
+                
+                n_low = [int(x) for x in low_xy]
+                n_high = [int(x) for x in high_xy]
+                ns = [x-y+1 for x,y in zip(n_high,n_low)]
                 mins = [float(x) for x in min_xy]
                 maxs = [float(x) for x in max_xy]
+                
+                orders = (order[0],order[2]) #Get order
+
+                if order == "+x-y":
+                    if sp != (0,0):
+                        offset = sp[0] + ns[0] * sp[1] 
+                        vs = offset * [u"データなし,-9999."] + vs
+                else:
+                    xr = range(ns[0]) if "+x" in order else range(ns[0]-1,-1,-1)
+                    yr = range(ns[1]) if "-y" in order else range(ns[1]-1,-1,-1)
+                    newvs = ns[0] * ns[1] * [u"データなし,-9999."]
+                    started = False
+                    vidx = 0
+                    for x in xr:
+                        for y in yr:
+                            if not started and x == sp[0] and y == sp[1]:
+                                started = True
+                            if started:
+                                newvs[x+ns[0]*y] = vs[vidx]
+                                vidx += 1
             else:
-                i = ''
+                i = u''
                 for l in child.itertext():
                     i += l
         ret = []
         delta = [maxs[0]-mins[0],maxs[1]-mins[1]]
         num = 0
-        for col in range(ns[0]):
-            for row in range(ns[1]):
+        nvs = len(vs)
+        for col in range(ns[1]):
+            for row in range(ns[0]):
                 new = dict(dic)
                 pro2 = dict(pro)
-                y = mins[0] + (float(col)/float(ns[0]))*float(delta[0])
-                x = mins[1] + (float(row)/float(ns[1]))*float(delta[1])
+                if orders[0] == "+":
+                    x = mins[1] + (float(row)/float(ns[0])*float(delta[1]))
+                else:
+                    x = maxs[1] - (float(row)/float(ns[0])*float(delta[1]))
+                if orders[1] == '+':
+                    y = mins[0] + (float(col)/float(ns[1]))*float(delta[0])
+                else:
+                    y = maxs[0] - (float(col)/float(ns[1]))*float(delta[0])
                 new['geometry'] = OD()
                 new['geometry']['type'] = 'Point'
                 new['geometry']['coordinates'] = (x,y)
-                pro2['alti'] = vs[num].split(',')[1]
-                pro2['type'] = vs[num].split(',')[0]
+                pro2['type'],pro2['alti'] = vs[num].split(',') if num < nvs else (u"データなし","-9999.")
                 new['properties'] = pro2
                 ret.append(new)
                 num += 1
@@ -210,7 +294,7 @@ class loader:
                         dic['geometry']['coordinates'] = i[0]
                     else:
                         dic['geometry']['coordinates'] = i
-            elif not child.text.strip() == '':
+            elif child.text is not None and not child.text.strip() == '':
                 dic['properties'][ctag]=child.text
             else:
                 i = ''
@@ -249,7 +333,7 @@ class loader:
                 return i
         return 'NULL'
 
-    def rindex(self,feature,rtree=False,shpfile=True):
+    def rindex(self,feature,mdic,rtree=False,shpfile=True):
         val = self.gobj[feature]
         if rtree:
             idx = index.Index()
@@ -296,32 +380,78 @@ class loader:
             elif y[k]["type"] == "Point":
                 s = shapely.geometry.Point(tuple(gc))
             else:
-                raise NotImplementedError(y[k]["type"])
-            if not s.is_valid: # fix invalid polygons
-                s = s.buffer(0)
-            y[k]["shapely"] = s
-            if rtree:
-                idx.insert(i,s.bounds)
+                if not shpfile:
+                    raise NotImplementedError(y[k]["type"])
+                if y[k]["type"] == "MultiPoint":
+                    
+                    ss = []
+                    for x in gc:
+                        stmp = shapely.geometry.Point(tuple(x))
+                        ss.append(stmp)
+                    s = shapely.geometry.MultiPoint(ss)
+                elif y[k]["type"] == "MultiLineString":
+                    ss = []
+                    for x in gc:
+                        coords =  [tuple(w) for w in x]
+                        stmp = shapely.geometry.LineString(coords)
+                        ss.append(stmp)
+                    s = shapely.geometry.MultiLineString(ss)
+                elif y[k]["type"] == "MultiPolygon":
+                    ss = []
+                    for x in gc:
+                        if len(x) == 1:
+                            stmp = shapely.geometry.Polygon(x[0])
+                        else:
+                            stmp = shapely.geometry.Polygon(x[0],x[1:])
+                        ss.append(stmp)
+                    s = shapely.geometry.MultiPolygon(ss)
+                else:
+                    raise NotImplementedError(y[k]["type"])
+                
+            if not s.is_valid:
+                if y[k]["type"] == "Polygon": # fix invalid polygons
+                    s = fix_poly(s,mdic)                   
+                elif y[k]["type"] == "LineString":
+                    s = fix_ls(s,mdic)
+                elif y[k]["type"] == "MultiPolygon": # fix invalid polygons
+                    s = fix_mpoly(s,mdic)
+                else:
+                    raise ValueError(s.wkt)
+
+            if s.is_valid:
+                y[k]["shapely"] = s
+                if rtree:
+                    try:
+                        idx.insert(i,s.bounds)
+                    except RTreeError:
+                        pass
+            else:
+                print("STILL INVALID")                
+                            
         if rtree:
             return idx
 
     def extract2(self,bounds,vals,idx):
         box = shapely.geometry.box(*bounds)
         ret = []
-
-        for i in idx.intersection(bounds): # rtree
-            y = vals[i]                    # rtree
-        #for y in vals:                    # !rtree
+        for i in idx.intersection(bounds):
+            y = vals[i]
             s = y["geometry"]["shapely"]
             try:
                 if not box.disjoint(s):
-                    newy = OD(y)
                     res = box.intersection(s)
-                    newy['geometry'] = mapping(res)
-                    ret.append(newy)
+                    geo = mapping(res) 
+                    if 'geometries' in geo:
+                        for x in geo['geometries']:
+                            newy = OD(y)
+                            newy[u'geometry'] = x
+                            newy["properties"] = y["properties"]
+                            ret.append(newy)
+                    else:
+                        newy = OD(y)
+                        newy[u'geometry'] = geo
+                        ret.append(newy)
             except:
-                print("SSS",s.type)
-                print("SSS",s.boundary.coords)
                 print("YYY",y["geometry"])
                 raise
         return ret
@@ -329,7 +459,7 @@ class loader:
     def extract3(self,bxs,vals):
         ret = {}
 
-        for y in vals:                    # !rtree
+        for y in vals:
             s = y["geometry"]["shapely"]
             tmp = {}
             for xid,yid,box in bxs:
